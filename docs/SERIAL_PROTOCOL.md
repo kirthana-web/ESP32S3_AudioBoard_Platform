@@ -13,8 +13,22 @@ Browser → board:
 Board → browser:
 
 ```json
-{"type":"hello.ack","protocol":1,"board":"waveshare-esp32-s3-audio","firmware":"0.1.0","capabilities":["led.ring","mic.stereo","speaker.pcm"]}
+{"type":"hello.ack","protocol":1,"board":"waveshare-esp32-s3-audio","firmware":"0.2.0","capabilities":["serial.heartbeat","led.ring","mic.stereo","speaker.pcm"]}
 ```
+
+Once connected, the browser sends a heartbeat every second:
+
+```json
+{"type":"ping","seq":42}
+```
+
+The board responds immediately:
+
+```json
+{"type":"pong","seq":42,"uptimeMs":91824}
+```
+
+The dashboard closes the session if no pong arrives for 3.5 seconds. The firmware also pauses microphone telemetry after 3.5 seconds without a ping, preventing a disconnected or stalled browser from creating serial backpressure. Ping/pong traffic is paused while raw speaker bytes are in flight.
 
 ## LED control
 
@@ -66,11 +80,11 @@ The next exactly `bytes` bytes are raw signed little-endian PCM with no line fra
 Board responses:
 
 ```json
-{"type":"speaker.ready","bufferBytes":8192}
+{"type":"speaker.ready","bufferBytes":65536}
 {"type":"speaker.done","playedBytes":64000,"underruns":0}
 ```
 
-For strict flow control, firmware may emit `speaker.credit` messages before transfer. The v1 dashboard currently uses 1,024-byte writes and relies on USB stream backpressure.
+The browser waits for `speaker.ready`, then sends 1,024-byte writes paced close to the 32 kB/s PCM consumption rate. No JSON control or heartbeat messages may be inserted between `speaker.begin` and the declared raw byte count.
 
 ## Errors
 

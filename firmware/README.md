@@ -1,6 +1,22 @@
 # Firmware adapter
 
-Audio Lab needs board firmware that implements `docs/SERIAL_PROTOCOL.md`. The dashboard and protocol are complete; this directory records the hardware contract for an ESP-IDF adapter.
+This directory now contains a flashable PlatformIO/Arduino implementation of `docs/SERIAL_PROTOCOL.md` for the Waveshare board. It drives the LED ring, streams dual-channel mic telemetry, applies ES7210 gain, and accepts signed 16-bit mono PCM for speaker playback.
+
+## Build and upload
+
+```bash
+cd firmware
+pio run
+pio run --target upload
+```
+
+The default serial rate is 921,600 baud. PlatformIO auto-detects the port because macOS can change names such as `usbmodem2101` to `usbmodem101` after a reset. The checked-in ES7210 and ES8311 drivers are the Apache-2.0-licensed versions distributed in Waveshare's official Arduino demo package.
+
+Run a heartbeat/LED/microphone soak test after flashing:
+
+```bash
+python tools/serial_soak.py --seconds 20
+```
 
 ## Verified Waveshare mappings
 

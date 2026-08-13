@@ -20,6 +20,7 @@ interface SerialNavigator extends Navigator {
 }
 
 const LEDS = 7;
+const DEFAULT_LED_COLOR = "#7C5CFF";
 const MODES: { id: LedMode; label: string; icon: string }[] = [
   { id: "solid", label: "Solid", icon: "●" },
   { id: "rainbow", label: "Rainbow", icon: "◒" },
@@ -119,7 +120,8 @@ export default function Home() {
   const [demo, setDemo] = useState(true);
   const [toast, setToast] = useState("");
   const [mode, setMode] = useState<LedMode>("rainbow");
-  const [color, setColor] = useState("#7c5cff");
+  const [color, setColor] = useState(DEFAULT_LED_COLOR);
+  const [colorInput, setColorInput] = useState(DEFAULT_LED_COLOR);
   const [brightness, setBrightness] = useState(72);
   const [speed, setSpeed] = useState(1.2);
   const [ease, setEase] = useState("sine");
@@ -141,6 +143,13 @@ export default function Home() {
   const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null);
   const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
   const bufferRef = useRef("");
+  const helloAckRef = useRef<(() => void) | null>(null);
+  const speakerReadyRef = useRef<(() => void) | null>(null);
+  const speakerDoneRef = useRef<(() => void) | null>(null);
+  const speakerTransferRef = useRef(false);
+  const lastPongAtRef = useRef(0);
+  const pingSequenceRef = useRef(0);
+  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
 
   const supported = typeof navigator !== "undefined" && Boolean((navigator as SerialNavigator).serial);
   const balance = (frame.right - frame.left) / Math.max(frame.left + frame.right, 0.001);
@@ -151,17 +160,56 @@ export default function Home() {
     window.setTimeout(() => setToast(""), 2400);
   }, []);
 
-  const send = useCallback(async (message: object) => {
-    if (!writerRef.current) return;
-    await writerRef.current.write(new TextEncoder().encode(`${JSON.stringify(message)}\n`));
+  const applyColor = useCallback((value: string) => {
+    const normalized = value.toUpperCase();
+    setColor(normalized);
+    setColorInput(normalized);
   }, []);
 
+  const editColor = useCallback((value: string) => {
+    const normalized = (value.startsWith("#") ? value : `#${value}`).toUpperCase();
+    if (!/^#[0-9A-F]{0,6}$/.test(normalized)) return;
+    setColorInput(normalized);
+    if (/^#[0-9A-F]{6}$/.test(normalized)) setColor(normalized);
+  }, []);
+
+  const send = useCallback(async (message: object) => {
+    const payload = new TextEncoder().encode(`${JSON.stringify(message)}\n`);
+    const operation = writeChainRef.current.then(async () => {
+      if (!writerRef.current) throw new Error("Serial output unavailable");
+      await writerRef.current.write(payload);
+    });
+    writeChainRef.current = operation.catch(() => undefined);
+    await operation;
+  }, []);
+
+  const disconnectSerial = useCallback(async (message?: string) => {
+    speakerTransferRef.current = false;
+    helloAckRef.current = null;
+    speakerReadyRef.current = null;
+    speakerDoneRef.current = null;
+    const reader = readerRef.current;
+    const writer = writerRef.current;
+    const port = portRef.current;
+    readerRef.current = null;
+    writerRef.current = null;
+    portRef.current = null;
+    await reader?.cancel().catch(() => undefined);
+    await writer?.abort().catch(() => undefined);
+    try { writer?.releaseLock(); } catch { /* Already released. */ }
+    await port?.close().catch(() => undefined);
+    writeChainRef.current = Promise.resolve();
+    setConnection("disconnected");
+    setDemo(true);
+    if (message) notify(message);
+  }, [notify]);
+
   useEffect(() => {
-    if (connection === "connected") send({ type: "led.set", mode, color, brightness, speed, easing: ease, led: selectedLed });
+    if (connection === "connected" && !speakerTransferRef.current) void send({ type: "led.set", mode, color, brightness, speed, easing: ease, led: selectedLed }).catch(() => undefined);
   }, [mode, color, brightness, speed, ease, selectedLed, connection, send]);
 
   useEffect(() => {
-    if (connection === "connected") send({ type: "mic.config", gainDb: gain, sensitivity, noiseGateDb: noiseGate, stream: monitoring });
+    if (connection === "connected" && !speakerTransferRef.current) void send({ type: "mic.config", gainDb: gain, sensitivity, noiseGateDb: noiseGate, stream: monitoring }).catch(() => undefined);
   }, [gain, sensitivity, noiseGate, monitoring, connection, send]);
 
   useEffect(() => {
@@ -187,9 +235,39 @@ export default function Home() {
       if (msg.type === "mic.frame" && typeof msg.left === "number" && typeof msg.right === "number") {
         setFrame((old) => ({ t: performance.now() / 1000, left: msg.left!, right: msg.right!, peakL: msg.peakL ?? msg.left!, peakR: msg.peakR ?? msg.right!, samples: msg.samples?.slice(0, 128) ?? old.samples }));
       }
+      if (msg.type === "hello.ack") {
+        helloAckRef.current?.();
+        helloAckRef.current = null;
+      }
+      if (msg.type === "speaker.ready") {
+        speakerReadyRef.current?.();
+        speakerReadyRef.current = null;
+      }
+      if (msg.type === "speaker.done") {
+        speakerDoneRef.current?.();
+        speakerDoneRef.current = null;
+      }
+      if (msg.type === "pong") lastPongAtRef.current = performance.now();
       if (msg.type === "error") notify(msg.message ?? "Device reported an error");
     } catch { /* Ignore boot logs and incomplete diagnostic lines. */ }
   }, [notify]);
+
+  useEffect(() => {
+    if (connection !== "connected") return;
+    lastPongAtRef.current = performance.now();
+    let recovering = false;
+    const interval = window.setInterval(() => {
+      if (speakerTransferRef.current || recovering) return;
+      if (performance.now() - lastPongAtRef.current > 3500) {
+        recovering = true;
+        window.clearInterval(interval);
+        void disconnectSerial("Serial heartbeat lost · reset the board and reconnect");
+        return;
+      }
+      void send({ type: "ping", seq: ++pingSequenceRef.current }).catch(() => undefined);
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [connection, disconnectSerial, send]);
 
   const readLoop = useCallback(async (port: SerialPortLike) => {
     if (!port.readable) return;
@@ -210,14 +288,7 @@ export default function Home() {
 
   const connect = async () => {
     if (connection === "connected") {
-      await readerRef.current?.cancel().catch(() => undefined);
-      await writerRef.current?.close().catch(() => undefined);
-      writerRef.current = null;
-      await portRef.current?.close().catch(() => undefined);
-      portRef.current = null;
-      setConnection("disconnected");
-      setDemo(true);
-      notify("Board disconnected · demo signal restored");
+      await disconnectSerial("Board disconnected · demo signal restored");
       return;
     }
     if (!supported) { notify("Web Serial needs Chrome, Edge, or the Codex desktop browser"); return; }
@@ -228,13 +299,19 @@ export default function Home() {
       if (!port.writable) throw new Error("Serial output unavailable");
       portRef.current = port;
       writerRef.current = port.writable.getWriter();
+      void readLoop(port);
+      const acknowledged = new Promise<void>((resolve) => { helloAckRef.current = resolve; });
+      await send({ type: "hello", protocol: 1 });
+      await Promise.race([
+        acknowledged,
+        new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Board opened, but firmware did not answer. Reset or reflash the board, then reconnect.")), 3000)),
+      ]);
       setConnection("connected");
       setDemo(false);
-      void readLoop(port);
-      await send({ type: "hello", protocol: 1 });
+      lastPongAtRef.current = performance.now();
       notify("ESP32-S3 Audio Board connected");
     } catch (error) {
-      setConnection("disconnected");
+      await disconnectSerial();
       notify(error instanceof Error ? error.message : "Could not connect to board");
     }
   };
@@ -266,17 +343,31 @@ export default function Home() {
   const playAudio = async () => {
     if (!audioFile) { notify("Choose a valid audio file first"); return; }
     if (connection !== "connected" || !writerRef.current) { notify("Connect the board before speaker playback"); return; }
+    speakerTransferRef.current = true;
     setPlaying(true);
     try {
       const all = new Uint8Array(await audioFile.arrayBuffer());
       const wav = String.fromCharCode(...all.slice(0, 4)) === "RIFF";
       const payload = wav ? all.slice(44) : all;
+      const ready = new Promise<void>((resolve) => { speakerReadyRef.current = resolve; });
       await send({ type: "speaker.begin", format: "pcm_s16le", sampleRate: 16000, channels: 1, bytes: payload.length, volume });
-      for (let offset = 0; offset < payload.length; offset += 1024) await writerRef.current.write(payload.slice(offset, offset + 1024));
+      await Promise.race([
+        ready,
+        new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Speaker did not become ready")), 2500)),
+      ]);
+      for (let offset = 0; offset < payload.length; offset += 1024) {
+        await writerRef.current.write(payload.slice(offset, offset + 1024));
+        await new Promise((resolve) => window.setTimeout(resolve, 24));
+      }
+      const done = new Promise<void>((resolve) => { speakerDoneRef.current = resolve; });
       await send({ type: "speaker.end" });
+      await Promise.race([
+        done,
+        new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("Speaker transfer did not finish")), 2500)),
+      ]);
       notify("Playback transferred to board");
-    } catch { notify("Playback transfer interrupted"); }
-    finally { setPlaying(false); }
+    } catch (error) { notify(error instanceof Error ? error.message : "Playback transfer interrupted"); }
+    finally { speakerReadyRef.current = null; speakerDoneRef.current = null; speakerTransferRef.current = false; lastPongAtRef.current = performance.now(); setPlaying(false); }
   };
 
   const ledPreview = useMemo(() => ({ mode, color, brightness, speed, ease }), [mode, color, brightness, speed, ease]);
@@ -310,13 +401,13 @@ export default function Home() {
           <div className="selection-note"><strong>{selectedLed === null ? "All pixels linked" : `Pixel ${selectedLed + 1} isolated`}</strong><span>{selectedLed === null ? "Changes are broadcast to the full ring" : "Click again to return to the full ring"}</span></div>
         </article>
         <article className="panel control-panel">
-          <div className="panel-heading"><div><p className="kicker">BEHAVIOUR</p><h2>Light composer</h2></div><button className="reset-link" onClick={() => { setMode("rainbow"); setBrightness(72); setSpeed(1.2); setEase("sine"); }}>Reset</button></div>
+          <div className="panel-heading"><div><p className="kicker">BEHAVIOUR</p><h2>Light composer</h2></div><button className="reset-link" onClick={() => { setMode("rainbow"); applyColor(DEFAULT_LED_COLOR); setBrightness(72); setSpeed(1.2); setEase("sine"); }}>Reset</button></div>
           <div className="mode-grid">{MODES.map((item) => <button key={item.id} className={mode === item.id ? "active" : ""} onClick={() => setMode(item.id)}><span>{item.icon}</span>{item.label}</button>)}</div>
-          <div className="color-row"><label><span className="field-label"><span>Colour</span><output>{color.toUpperCase()}</output></span><span className="color-control"><input aria-label="LED color" type="color" value={color} onChange={(e) => setColor(e.target.value)} /><i style={{ background: color }} /><input value={color.toUpperCase()} onChange={(e) => /^#[0-9a-f]{6}$/i.test(e.target.value) && setColor(e.target.value)} aria-label="LED color hex" /></span></label><div className="swatches">{["#7c5cff", "#00d4a6", "#ffb547", "#ff5370", "#42a5ff"].map((swatch) => <button key={swatch} aria-label={`Use ${swatch}`} style={{ background: swatch }} onClick={() => setColor(swatch)} />)}</div></div>
+          <div className="color-row"><label><span className="field-label"><span>Colour</span><output>{color}</output></span><span className="color-control"><input aria-label="LED color" type="color" value={color} onChange={(e) => applyColor(e.target.value)} /><i style={{ background: color }} /><input value={colorInput} maxLength={7} spellCheck={false} autoCapitalize="characters" onChange={(e) => editColor(e.target.value)} onBlur={() => setColorInput(color)} onKeyDown={(e) => { if (e.key === "Enter" && /^#[0-9A-F]{6}$/.test(colorInput)) e.currentTarget.blur(); }} aria-label="LED color hex" /></span></label><div className="swatches">{["#7C5CFF", "#00D4A6", "#FFB547", "#FF5370", "#42A5FF"].map((swatch) => <button key={swatch} aria-label={`Use ${swatch}`} style={{ background: swatch }} onClick={() => applyColor(swatch)} />)}</div></div>
           <Range label="Brightness" value={brightness} min={0} max={100} unit="%" onChange={setBrightness} />
           <Range label={mode === "flicker" ? "Flicker rate" : "Animation speed"} value={speed} min={0.1} max={4} step={0.1} unit="×" onChange={setSpeed} />
           <div className="select-field"><label className="field-label" htmlFor="easing"><span>Easing curve</span><output>transition</output></label><select id="easing" value={ease} onChange={(e) => setEase(e.target.value)}><option value="sine">Sine · soft</option><option value="linear">Linear · mechanical</option><option value="quadIn">Ease in · accelerating</option><option value="quadOut">Ease out · settling</option><option value="smoothstep">Smoothstep · organic</option></select></div>
-          <div className="command-preview"><span>DEVICE COMMAND</span><code>{JSON.stringify({ mode, brightness, speed, easing: ease })}</code></div>
+          <div className="command-preview"><span>DEVICE COMMAND</span><code>{JSON.stringify({ mode, color, brightness, speed, easing: ease })}</code></div>
         </article>
       </section>}
 
