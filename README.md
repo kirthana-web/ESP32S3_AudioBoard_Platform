@@ -5,6 +5,7 @@ Browser-based hardware test console for the [Waveshare ESP32-S3-AUDIO-Board](htt
 ## What is included
 
 - Seven-pixel RGB ring control: solid, rainbow, breathing, orbit/chase, and flicker modes; colour, brightness, rate, easing, and single-pixel selection.
+- ST7789V3 eye display: on/off control and seven ESP32-rendered expressive animation states with eased transitions.
 - Dual-microphone lab: live waveform, independent levels and peaks, channel-balance direction cue, codec gain, visual sensitivity, noise gate, physical-condition tags, CSV export.
 - Speaker verifier: validates 16 kHz, signed 16-bit, mono PCM WAV files (or explicitly named raw `.pcm` / `.raw`), then transfers them to the board.
 - A simulated mic signal when no board is connected, so the interface can be evaluated immediately.

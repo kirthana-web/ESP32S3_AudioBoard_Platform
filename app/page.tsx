@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type Tab = "led" | "mic" | "speaker";
+type Tab = "led" | "display" | "mic" | "speaker";
 type LedMode = "solid" | "rainbow" | "breathe" | "chase" | "flicker";
+type EyeAnimation = "idle" | "happy" | "curious" | "excited" | "sleepy" | "thinking" | "surprised";
 type ConnectionState = "disconnected" | "connecting" | "connected";
 type MicFrame = { t: number; left: number; right: number; peakL: number; peakR: number; samples: number[] };
 type LogRow = { at: string; distance: number; angle: number; material: string; gain: number; sensitivity: number; left: number; right: number; balance: number };
@@ -27,6 +28,15 @@ const MODES: { id: LedMode; label: string; icon: string }[] = [
   { id: "breathe", label: "Breathe", icon: "◉" },
   { id: "chase", label: "Orbit", icon: "↗" },
   { id: "flicker", label: "Flicker", icon: "✦" },
+];
+const EYE_ANIMATIONS: { id: EyeAnimation; label: string; note: string; icon: string }[] = [
+  { id: "idle", label: "Idle / Alive", note: "Natural gaze and irregular blinks", icon: "◉" },
+  { id: "happy", label: "Happy", note: "Soft squint with a buoyant settle", icon: "⌒" },
+  { id: "curious", label: "Curious", note: "Asymmetric look and inspection", icon: "?" },
+  { id: "excited", label: "Excited", note: "Anticipation, bounce, and follow-through", icon: "↑" },
+  { id: "sleepy", label: "Sleepy", note: "Heavy lids and slow drift", icon: "–" },
+  { id: "thinking", label: "Thinking / Scan", note: "Arced search with offset timing", icon: "↝" },
+  { id: "surprised", label: "Surprised", note: "Quick squash, wide reaction, settle", icon: "!" },
 ];
 
 function hexToRgb(hex: string) {
@@ -91,6 +101,19 @@ function Ring({ mode, color, brightness, speed, active, now, onSelect }: { mode:
   );
 }
 
+function EyePreview({ enabled, animation }: { enabled: boolean; animation: EyeAnimation }) {
+  return (
+    <div className={`lcd-preview ${enabled ? "enabled" : "disabled"} eye-${animation}`} aria-label={`${enabled ? "On" : "Off"}, ${animation} eye animation preview`}>
+      <div className="lcd-glass">
+        <div className="preview-eye left"><i /><b /></div>
+        <div className="preview-eye right"><i /><b /></div>
+        <span className="lcd-shine" />
+      </div>
+      <div className="lcd-meta"><span><i className={`dot ${enabled ? "online" : ""}`} /> {enabled ? "DISPLAY ON" : "DISPLAY OFF"}</span><span>320 × 172 · ST7789V3</span></div>
+    </div>
+  );
+}
+
 function Waveform({ frame, sensitivity }: { frame: MicFrame; sensitivity: number }) {
   const points = frame.samples.map((sample, i) => `${(i / Math.max(1, frame.samples.length - 1)) * 100},${50 - sample * sensitivity * 0.34}`).join(" ");
   return (
@@ -126,6 +149,8 @@ export default function Home() {
   const [speed, setSpeed] = useState(1.2);
   const [ease, setEase] = useState("sine");
   const [selectedLed, setSelectedLed] = useState<number | null>(null);
+  const [displayEnabled, setDisplayEnabled] = useState(true);
+  const [eyeAnimation, setEyeAnimation] = useState<EyeAnimation>("idle");
   const [gain, setGain] = useState(24);
   const [sensitivity, setSensitivity] = useState(1.4);
   const [noiseGate, setNoiseGate] = useState(-58);
@@ -150,6 +175,7 @@ export default function Home() {
   const lastPongAtRef = useRef(0);
   const pingSequenceRef = useRef(0);
   const writeChainRef = useRef<Promise<void>>(Promise.resolve());
+  const displayRequestRef = useRef(0);
 
   const supported = typeof navigator !== "undefined" && Boolean((navigator as SerialNavigator).serial);
   const balance = (frame.right - frame.left) / Math.max(frame.left + frame.right, 0.001);
@@ -213,6 +239,12 @@ export default function Home() {
   }, [gain, sensitivity, noiseGate, monitoring, connection, send]);
 
   useEffect(() => {
+    if (connection === "connected" && !speakerTransferRef.current) {
+      void send({ type: "display.set", enabled: displayEnabled, animation: eyeAnimation, requestId: ++displayRequestRef.current }).catch(() => undefined);
+    }
+  }, [displayEnabled, eyeAnimation, connection, send]);
+
+  useEffect(() => {
     if (!demo || connection === "connected" || !monitoring) return;
     const interval = window.setInterval(() => {
       const t = performance.now() / 1000;
@@ -231,7 +263,7 @@ export default function Home() {
 
   const handleLine = useCallback((line: string) => {
     try {
-      const msg = JSON.parse(line) as { type?: string; left?: number; right?: number; peakL?: number; peakR?: number; samples?: number[]; message?: string };
+      const msg = JSON.parse(line) as { type?: string; left?: number; right?: number; peakL?: number; peakR?: number; samples?: number[]; message?: string; enabled?: boolean; animation?: string };
       if (msg.type === "mic.frame" && typeof msg.left === "number" && typeof msg.right === "number") {
         setFrame((old) => ({ t: performance.now() / 1000, left: msg.left!, right: msg.right!, peakL: msg.peakL ?? msg.left!, peakR: msg.peakR ?? msg.right!, samples: msg.samples?.slice(0, 128) ?? old.samples }));
       }
@@ -248,6 +280,9 @@ export default function Home() {
         speakerDoneRef.current = null;
       }
       if (msg.type === "pong") lastPongAtRef.current = performance.now();
+      if ((msg.type === "display.state" || msg.type === "display.ack") && typeof msg.enabled === "boolean") setDisplayEnabled(msg.enabled);
+      if ((msg.type === "display.state" || msg.type === "display.ack") && EYE_ANIMATIONS.some((item) => item.id === msg.animation)) setEyeAnimation(msg.animation as EyeAnimation);
+      if (msg.type === "display.animation.complete" && msg.animation === "surprised") setEyeAnimation("idle");
       if (msg.type === "error") notify(msg.message ?? "Device reported an error");
     } catch { /* Ignore boot logs and incomplete diagnostic lines. */ }
   }, [notify]);
@@ -389,6 +424,7 @@ export default function Home() {
 
       <nav className="tabs" aria-label="Test modules">
         <button className={tab === "led" ? "active" : ""} onClick={() => setTab("led")}><span>◉</span><div>LIGHT<small>LED ring control</small></div></button>
+        <button className={tab === "display" ? "active" : ""} onClick={() => setTab("display")}><span>◫</span><div>LOOK<small>Eye display</small></div></button>
         <button className={tab === "mic" ? "active" : ""} onClick={() => setTab("mic")}><span>⌁</span><div>LISTEN<small>Microphone lab</small></div></button>
         <button className={tab === "speaker" ? "active" : ""} onClick={() => setTab("speaker")}><span>◖</span><div>PLAY<small>Speaker verifier</small></div></button>
         <button className="future" disabled><span>＋</span><div>EXPAND<small>MPR121 · FSR · more</small></div></button>
@@ -408,6 +444,20 @@ export default function Home() {
           <Range label={mode === "flicker" ? "Flicker rate" : "Animation speed"} value={speed} min={0.1} max={4} step={0.1} unit="×" onChange={setSpeed} />
           <div className="select-field"><label className="field-label" htmlFor="easing"><span>Easing curve</span><output>transition</output></label><select id="easing" value={ease} onChange={(e) => setEase(e.target.value)}><option value="sine">Sine · soft</option><option value="linear">Linear · mechanical</option><option value="quadIn">Ease in · accelerating</option><option value="quadOut">Ease out · settling</option><option value="smoothstep">Smoothstep · organic</option></select></div>
           <div className="command-preview"><span>DEVICE COMMAND</span><code>{JSON.stringify({ mode, color, brightness, speed, easing: ease })}</code></div>
+        </article>
+      </section>}
+
+      {tab === "display" && <section className="workspace display-workspace">
+        <article className="panel visual-panel display-visual">
+          <div className="panel-heading"><div><p className="kicker">LIVE OUTPUT</p><h2>Expressive eye display</h2></div><span className="format-chip">LANDSCAPE</span></div>
+          <EyePreview enabled={displayEnabled} animation={eyeAnimation} />
+          <div className="selection-note"><strong>{EYE_ANIMATIONS.find((item) => item.id === eyeAnimation)?.label}</strong><span>Rendered locally on the ESP32 at 24 fps</span></div>
+        </article>
+        <article className="panel control-panel display-controls">
+          <div className="panel-heading"><div><p className="kicker">CHARACTER MOTION</p><h2>Eye animator</h2></div><label className="toggle display-toggle"><input type="checkbox" checked={displayEnabled} onChange={(e) => setDisplayEnabled(e.target.checked)} /><i /><span>{displayEnabled ? "On" : "Off"}</span></label></div>
+          <p className="display-intro">Choose a motion state. The board handles key poses, easing, blinks, and transitions without streaming frames over serial.</p>
+          <div className="animation-list" aria-label="Eye animation choices">{EYE_ANIMATIONS.map((item) => <button key={item.id} disabled={!displayEnabled} className={eyeAnimation === item.id ? "active" : ""} onClick={() => setEyeAnimation(item.id)}><span>{item.icon}</span><div><strong>{item.label}</strong><small>{item.note}</small></div><i>→</i></button>)}</div>
+          <div className="command-preview"><span>DEVICE COMMAND</span><code>{JSON.stringify({ enabled: displayEnabled, animation: eyeAnimation })}</code></div>
         </article>
       </section>}
 

@@ -13,7 +13,7 @@ Browser → board:
 Board → browser:
 
 ```json
-{"type":"hello.ack","protocol":1,"board":"waveshare-esp32-s3-audio","firmware":"0.2.0","capabilities":["serial.heartbeat","led.ring","mic.stereo","speaker.pcm"]}
+{"type":"hello.ack","protocol":1,"board":"waveshare-esp32-s3-audio","firmware":"0.3.0","capabilities":["serial.heartbeat","led.ring","mic.stereo","speaker.pcm","display.eyes"]}
 ```
 
 Once connected, the browser sends a heartbeat every second:
@@ -43,6 +43,28 @@ The dashboard closes the session if no pong arrives for 3.5 seconds. The firmwar
 - `led`: `null` for the whole ring or a zero-based pixel index.
 
 The firmware owns animation timing. The dashboard sends state changes only, preventing serial jitter from appearing in continuous effects.
+
+## Eye display control
+
+The 172 × 320 ST7789V3 LCD is used in landscape orientation. The browser sends state changes only; the ESP32 renders and eases every frame locally.
+
+```json
+{"type":"display.set","enabled":true,"animation":"curious","requestId":42}
+```
+
+`animation` is `idle`, `happy`, `curious`, `excited`, `sleepy`, `thinking`, or `surprised`. Repeating the active state is idempotent and does not restart the animation. The board acknowledges every request:
+
+```json
+{"type":"display.ack","enabled":true,"animation":"curious","requestId":42}
+```
+
+After `hello.ack`, the board reports its current state so a reconnected dashboard matches the hardware:
+
+```json
+{"type":"display.state","enabled":true,"animation":"idle","ready":true}
+```
+
+`surprised` is a one-shot animation. After its reaction and recovery blink, firmware returns to idle and emits `display.animation.complete`.
 
 ## Microphone configuration and telemetry
 

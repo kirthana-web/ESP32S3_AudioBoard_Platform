@@ -1,6 +1,6 @@
 # Firmware adapter
 
-This directory now contains a flashable PlatformIO/Arduino implementation of `docs/SERIAL_PROTOCOL.md` for the Waveshare board. It drives the LED ring, streams dual-channel mic telemetry, applies ES7210 gain, and accepts signed 16-bit mono PCM for speaker playback.
+This directory now contains a flashable PlatformIO/Arduino implementation of `docs/SERIAL_PROTOCOL.md` for the Waveshare board. It drives the LED ring and 1.47-inch eye display, streams dual-channel mic telemetry, applies ES7210 gain, and accepts signed 16-bit mono PCM for speaker playback.
 
 ## Build and upload
 
@@ -34,6 +34,12 @@ These values come from the current official Waveshare demo package and its `bsp_
 | Microphone codec | ES7210, default address 0x40 |
 | Speaker codec | ES8311 |
 | Amplifier enable | TCA9555 expander output 8 |
+| LCD controller / size | ST7789V3, 172 × 320 (landscape 320 × 172) |
+| LCD DIN / CLK / CS | GPIO 6 / GPIO 4 / GPIO 3 |
+| LCD DC / backlight | GPIO 7 / GPIO 5 |
+| LCD reset | TCA9555 extended output 0 |
+
+The LCD mapping above matches the photographed Dupont wiring to the board's QSPI-LCD breakout. `DIN` intentionally uses GPIO 6 (the breakout's `LCD_SDA3`) rather than the separate FPC connector's SPI-MOSI mapping. Power is connected to 5 V and GND as shown; the Waveshare module accepts 3.3 V or 5 V supply.
 
 The shared I²S bus is configured at 16 kHz. Waveshare's current ESP-IDF demo opens the ES7210 as two-channel, 32-bit codec data and converts speaker PCM as needed; preserve that bus configuration even though the browser accepts 16-bit mono speaker files.
 

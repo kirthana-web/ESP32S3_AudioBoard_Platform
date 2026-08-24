@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise heartbeat, LED control, and mic telemetry over one serial session."""
+"""Exercise heartbeat, LEDs, eye display, and mic telemetry over one serial session."""
 
 import argparse
 import json
@@ -43,7 +43,12 @@ def main() -> None:
     started = time.monotonic()
     next_ping = started
     next_led = started
+    next_display = started + 1
     led_phase = 0
+    display_phase = 0
+    display_acks: set[int] = set()
+    display_ready = False
+    animations = ["idle", "happy", "curious", "excited", "sleepy", "thinking", "surprised"]
 
     def send(message: dict) -> None:
         port.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
@@ -71,6 +76,15 @@ def main() -> None:
                     "led": None,
                 })
                 next_led += 3
+            if now >= next_display:
+                display_phase += 1
+                send({
+                    "type": "display.set",
+                    "enabled": display_phase % 9 != 8,
+                    "animation": animations[(display_phase - 1) % len(animations)],
+                    "requestId": display_phase,
+                })
+                next_display += 1
 
             received.extend(port.read(8192))
             while b"\n" in received:
@@ -87,6 +101,10 @@ def main() -> None:
                     pong_sequences.add(int(message.get("seq", -1)))
                 elif message_type == "mic.frame":
                     mic_frames += 1
+                elif message_type == "display.ready" or (message_type == "display.state" and message.get("ready")):
+                    display_ready = True
+                elif message_type == "display.ack":
+                    display_acks.add(int(message.get("requestId", -1)))
                 elif message_type == "error":
                     errors.append(message)
     finally:
@@ -101,10 +119,14 @@ def main() -> None:
         "pongs": len(pong_sequences),
         "missingPongs": missing,
         "micFrames": mic_frames,
+        "displayReady": display_ready,
+        "displayCommands": display_phase,
+        "displayAcks": len(display_acks),
         "errors": errors,
     }, indent=2))
 
-    if not hello or missing or not mic_frames or errors:
+    missing_display_acks = set(range(1, display_phase + 1)) - display_acks
+    if not hello or missing or not mic_frames or not display_ready or missing_display_acks or errors:
         raise SystemExit(1)
 
 

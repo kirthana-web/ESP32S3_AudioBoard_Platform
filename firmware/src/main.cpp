@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <ESP_I2S.h>
 #include <Adafruit_NeoPixel.h>
+#include <Arduino_GFX_Library.h>
 #include "es7210.h"
 #include "es8311.h"
 
@@ -15,11 +16,20 @@ constexpr int I2S_DIN = 15;
 constexpr int I2S_DOUT = 16;
 constexpr int LED_DATA = 38;
 constexpr int LED_COUNT = 7;
+// The photographed 1.47-inch module follows the board's QSPI-LCD breakout:
+// DIN=IO6, CLK=IO4, CS=IO3, DC=IO7, RST=extended IO0, BL=IO5.
+constexpr int LCD_MOSI = 6;
+constexpr int LCD_SCK = 4;
+constexpr int LCD_CS = 3;
+constexpr int LCD_DC = 7;
+constexpr int LCD_BL = 5;
+constexpr int LCD_RST_EXIO = 0;
 constexpr uint8_t TCA9555 = 0x20;
 }
 
 enum class LedMode { Solid, Rainbow, Breathe, Chase, Flicker };
 enum class Ease { Sine, Linear, QuadIn, QuadOut, Smoothstep };
+enum class EyeAnimation { Idle, Happy, Curious, Excited, Sleepy, Thinking, Surprised };
 
 struct LedState {
   LedMode mode = LedMode::Rainbow;
@@ -33,6 +43,12 @@ struct LedState {
 I2SClass audioBus;
 // Waveshare's factory firmware declares this board's WS2812 component order as RGB.
 Adafruit_NeoPixel pixels(board::LED_COUNT, board::LED_DATA, NEO_RGB + NEO_KHZ800);
+Arduino_DataBus *lcdBus = new Arduino_ESP32SPI(
+  board::LCD_DC, board::LCD_CS, board::LCD_SCK, board::LCD_MOSI,
+  GFX_NOT_DEFINED, HSPI);
+// ST7789 RAM is 240 px wide; the module exposes the centred 172 px window.
+Arduino_GFX *lcd = new Arduino_ST7789(
+  lcdBus, GFX_NOT_DEFINED, 1, true, 172, 320, 34, 0, 34, 0);
 es7210_dev_handle_t micCodec = nullptr;
 es8311_handle_t speakerCodec = nullptr;
 
@@ -50,10 +66,42 @@ uint8_t speakerVolume = 55;
 uint32_t lastLedFrame = 0;
 uint32_t lastHostPing = 0;
 bool heartbeatActive = false;
+bool displayReady = false;
+bool displayInitAttempted = false;
+bool displayEnabled = true;
+bool displaySleeping = true;
+EyeAnimation eyeAnimation = EyeAnimation::Idle;
+uint32_t eyeAnimationStartedAt = 0;
+uint32_t displayChangedAt = 0;
+uint32_t eyeTransitionStartedAt = 0;
+uint32_t lastDisplayFrame = 0;
+
+struct EyePose {
+  float openL = 1.0f, openR = 1.0f;
+  float gazeX = 0.0f, gazeY = 0.0f;
+  float pupil = 1.0f;
+  float scaleX = 1.0f, scaleY = 1.0f;
+  float offsetY = 0.0f;
+};
+
+EyePose lastEyePose;
+EyePose transitionFromPose;
 
 static void sendError(const char *code, const char *message);
 
 static float clamp01(float value) { return value < 0 ? 0 : value > 1 ? 1 : value; }
+static float smoothstep(float value) { value = clamp01(value); return value * value * (3.0f - 2.0f * value); }
+static float mixFloat(float a, float b, float amount) { return a + (b - a) * amount; }
+
+static EyePose mixPose(const EyePose &a, const EyePose &b, float amount) {
+  EyePose out;
+  amount = smoothstep(amount);
+  out.openL = mixFloat(a.openL, b.openL, amount); out.openR = mixFloat(a.openR, b.openR, amount);
+  out.gazeX = mixFloat(a.gazeX, b.gazeX, amount); out.gazeY = mixFloat(a.gazeY, b.gazeY, amount);
+  out.pupil = mixFloat(a.pupil, b.pupil, amount); out.scaleX = mixFloat(a.scaleX, b.scaleX, amount);
+  out.scaleY = mixFloat(a.scaleY, b.scaleY, amount); out.offsetY = mixFloat(a.offsetY, b.offsetY, amount);
+  return out;
+}
 
 static float applyEase(float value) {
   value = clamp01(value);
@@ -113,6 +161,196 @@ static uint8_t i2cRead(uint8_t device, uint8_t reg) {
   Wire.beginTransmission(device); Wire.write(reg); Wire.endTransmission(false);
   Wire.requestFrom(device, (uint8_t)1);
   return Wire.available() ? Wire.read() : 0xff;
+}
+
+static void setExtendedOutput(uint8_t index, bool high) {
+  const uint8_t bank = index / 8;
+  const uint8_t bit = index % 8;
+  const uint8_t configReg = 0x06 + bank;
+  const uint8_t outputReg = 0x02 + bank;
+  uint8_t config = i2cRead(board::TCA9555, configReg);
+  uint8_t output = i2cRead(board::TCA9555, outputReg);
+  i2cWrite(board::TCA9555, configReg, config & ~(1u << bit));
+  i2cWrite(board::TCA9555, outputReg, high ? output | (1u << bit) : output & ~(1u << bit));
+}
+
+static const char *eyeAnimationName(EyeAnimation animation) {
+  switch (animation) {
+    case EyeAnimation::Happy: return "happy";
+    case EyeAnimation::Curious: return "curious";
+    case EyeAnimation::Excited: return "excited";
+    case EyeAnimation::Sleepy: return "sleepy";
+    case EyeAnimation::Thinking: return "thinking";
+    case EyeAnimation::Surprised: return "surprised";
+    default: return "idle";
+  }
+}
+
+static EyeAnimation parseEyeAnimation(const String &name) {
+  if (name == "happy") return EyeAnimation::Happy;
+  if (name == "curious") return EyeAnimation::Curious;
+  if (name == "excited") return EyeAnimation::Excited;
+  if (name == "sleepy") return EyeAnimation::Sleepy;
+  if (name == "thinking") return EyeAnimation::Thinking;
+  if (name == "surprised") return EyeAnimation::Surprised;
+  return EyeAnimation::Idle;
+}
+
+static float blinkAmount(uint32_t elapsed, uint32_t centre, uint32_t halfWidth) {
+  const int32_t distance = abs((int32_t)elapsed - (int32_t)centre);
+  if (distance >= (int32_t)halfWidth) return 1.0f;
+  return smoothstep(distance / (float)halfWidth);
+}
+
+static EyePose evaluateEyeAnimation(EyeAnimation animation, uint32_t elapsed) {
+  EyePose pose;
+  const float seconds = elapsed / 1000.0f;
+  switch (animation) {
+    case EyeAnimation::Idle: {
+      const uint32_t cycle = elapsed % 4700;
+      pose.gazeX = 0.12f * sinf(seconds * 1.05f);
+      pose.gazeY = 0.04f * sinf(seconds * 0.63f + 1.2f);
+      const float blink = min(blinkAmount(cycle, 3230, 125), blinkAmount(cycle, 3470, 80));
+      pose.openL = pose.openR = blink;
+      pose.scaleX = 1.0f + (1.0f - blink) * 0.08f;
+      pose.scaleY = 1.0f - (1.0f - blink) * 0.14f;
+      break;
+    }
+    case EyeAnimation::Happy:
+      pose.openL = pose.openR = 0.58f + 0.08f * (0.5f + 0.5f * sinf(seconds * 2.4f));
+      pose.gazeX = 0.08f * sinf(seconds * 1.2f);
+      pose.offsetY = -0.03f * sinf(seconds * 2.4f);
+      pose.pupil = 0.96f;
+      break;
+    case EyeAnimation::Curious: {
+      const uint32_t cycleIndex = elapsed / 3800;
+      const float direction = cycleIndex % 2 ? -1.0f : 1.0f;
+      const float phase = (elapsed % 3800) / 3800.0f;
+      pose.gazeX = direction * (0.42f + 0.18f * sinf(phase * TWO_PI));
+      pose.gazeY = -0.08f + 0.13f * sinf(phase * TWO_PI + 0.8f);
+      pose.openL = direction > 0 ? 0.82f : 1.06f;
+      pose.openR = direction > 0 ? 1.06f : 0.82f;
+      pose.pupil = 1.12f;
+      break;
+    }
+    case EyeAnimation::Excited: {
+      const float phase = fmodf(seconds / 1.4f, 1.0f);
+      pose.openL = pose.openR = 1.06f;
+      pose.pupil = 1.12f;
+      pose.offsetY = -0.07f * sinf(phase * PI);
+      pose.scaleY = 1.0f + 0.08f * sinf(phase * TWO_PI);
+      pose.scaleX = 2.0f - pose.scaleY;
+      break;
+    }
+    case EyeAnimation::Sleepy: {
+      const uint32_t cycle = elapsed % 5200;
+      pose.openL = pose.openR = 0.38f + 0.07f * sinf(seconds * 1.2f);
+      pose.openL *= blinkAmount(cycle, 2700, 430);
+      pose.openR = pose.openL;
+      pose.gazeX = 0.10f * sinf(seconds * 0.8f);
+      pose.gazeY = 0.24f;
+      pose.pupil = 0.94f;
+      break;
+    }
+    case EyeAnimation::Thinking:
+      pose.gazeX = 0.55f * sinf(seconds * 1.75f);
+      pose.gazeY = 0.18f * sinf(seconds * 1.12f + 1.1f);
+      pose.pupil = 0.96f;
+      pose.openL = 0.96f; pose.openR = 1.0f;
+      break;
+    case EyeAnimation::Surprised: {
+      if (elapsed < 80) pose.openL = pose.openR = mixFloat(1.0f, 0.78f, elapsed / 80.0f);
+      else if (elapsed < 210) pose.openL = pose.openR = mixFloat(0.78f, 1.12f, (elapsed - 80) / 130.0f);
+      else if (elapsed < 1650) pose.openL = pose.openR = mixFloat(1.12f, 1.06f, min(1.0f, (elapsed - 210) / 210.0f));
+      else if (elapsed < 1760) pose.openL = pose.openR = mixFloat(1.06f, 0.02f, (elapsed - 1650) / 110.0f);
+      else if (elapsed < 1910) pose.openL = pose.openR = mixFloat(0.02f, 1.03f, (elapsed - 1760) / 150.0f);
+      pose.pupil = elapsed > 170 && elapsed < 1650 ? 0.76f : 1.0f;
+      break;
+    }
+  }
+  return pose;
+}
+
+static void drawEye(int cx, const EyePose &pose, bool left) {
+  constexpr uint16_t background = 0x0841;
+  constexpr uint16_t sclera = 0xffff;
+  constexpr uint16_t iris = 0x7b5f;
+  constexpr uint16_t pupilColor = 0x0000;
+  const float openness = constrain(left ? pose.openL : pose.openR, 0.02f, 1.12f);
+  const int cy = 86 + (int)(pose.offsetY * 90.0f);
+  const int eyeRx = constrain((int)(38 * pose.scaleX), 30, 44);
+  const int eyeRy = constrain((int)(45 * pose.scaleY * openness), 2, 51);
+  const int pupilRx = constrain((int)(14 * pose.pupil), 9, 19);
+  const int pupilRy = min(pupilRx, max(2, eyeRy - 3));
+  const int pupilX = cx + (int)(pose.gazeX * max(1, eyeRx - pupilRx - 5));
+  const int pupilY = cy + (int)(pose.gazeY * max(1, eyeRy - pupilRy - 4));
+
+  lcd->fillRect(cx - 51, 16, 102, 140, background);
+  if (eyeRy <= 3) {
+    lcd->fillRoundRect(cx - 36, cy - 2, 72, 4, 2, iris);
+    return;
+  }
+  lcd->fillEllipse(cx, cy, eyeRx, eyeRy, sclera);
+  lcd->fillEllipse(pupilX, pupilY, pupilRx, pupilRy, iris);
+  lcd->fillEllipse(pupilX, pupilY, max(4, pupilRx / 2), max(3, pupilRy / 2), pupilColor);
+  if (pupilRy > 6) lcd->fillCircle(pupilX - pupilRx / 3, pupilY - pupilRy / 3, 3, sclera);
+}
+
+static bool initializeDisplay() {
+  pinMode(board::LCD_BL, OUTPUT);
+  digitalWrite(board::LCD_BL, LOW);
+  setExtendedOutput(board::LCD_RST_EXIO, false);
+  delay(20);
+  setExtendedOutput(board::LCD_RST_EXIO, true);
+  delay(120);
+  if (!lcd->begin(40000000)) return false;
+  lcd->invertDisplay(true);
+  lcd->fillScreen(0x0841);
+  displaySleeping = !displayEnabled;
+  digitalWrite(board::LCD_BL, displayEnabled ? HIGH : LOW);
+  eyeAnimationStartedAt = millis();
+  eyeTransitionStartedAt = millis();
+  Serial.println("{\"type\":\"display.ready\",\"width\":320,\"height\":172,\"controller\":\"ST7789V3\"}");
+  return true;
+}
+
+static void renderDisplay() {
+  if (!displayReady) return;
+  const uint32_t now = millis();
+  if (now - lastDisplayFrame < 42) return; // ~24 fps; leaves serial/audio headroom.
+  lastDisplayFrame = now;
+
+  if (!displayEnabled) {
+    const float closeAmount = (now - displayChangedAt) / 180.0f;
+    if (closeAmount < 1.0f) {
+      EyePose closed = lastEyePose; closed.openL = closed.openR = 0.02f;
+      EyePose pose = mixPose(transitionFromPose, closed, closeAmount);
+      drawEye(109, pose, true); drawEye(211, pose, false); lastEyePose = pose;
+    } else if (!displaySleeping) {
+      EyePose closed = lastEyePose; closed.openL = closed.openR = 0.02f;
+      drawEye(109, closed, true); drawEye(211, closed, false);
+      digitalWrite(board::LCD_BL, LOW);
+      displaySleeping = true;
+    }
+    return;
+  }
+
+  if (displaySleeping) {
+    digitalWrite(board::LCD_BL, HIGH);
+    displaySleeping = false;
+  }
+  if (eyeAnimation == EyeAnimation::Surprised && now - eyeAnimationStartedAt >= 2200) {
+    eyeAnimation = EyeAnimation::Idle;
+    eyeAnimationStartedAt = now;
+    transitionFromPose = lastEyePose;
+    eyeTransitionStartedAt = now;
+    Serial.println("{\"type\":\"display.animation.complete\",\"animation\":\"surprised\",\"next\":\"idle\"}");
+  }
+  EyePose target = evaluateEyeAnimation(eyeAnimation, now - eyeAnimationStartedAt);
+  const uint32_t transitionElapsed = now - eyeTransitionStartedAt;
+  EyePose pose = transitionElapsed < 180 ? mixPose(transitionFromPose, target, transitionElapsed / 180.0f) : target;
+  drawEye(109, pose, true); drawEye(211, pose, false);
+  lastEyePose = pose;
 }
 
 static void enableAmplifier(bool enabled) {
@@ -208,7 +446,9 @@ static void handleCommand(const String &line) {
   if (type == "hello") {
     lastHostPing = millis();
     heartbeatActive = true;
-    Serial.println("{\"type\":\"hello.ack\",\"protocol\":1,\"board\":\"waveshare-esp32-s3-audio\",\"firmware\":\"0.2.0\",\"capabilities\":[\"serial.heartbeat\",\"led.ring\",\"mic.stereo\",\"speaker.pcm\"]}");
+    Serial.println("{\"type\":\"hello.ack\",\"protocol\":1,\"board\":\"waveshare-esp32-s3-audio\",\"firmware\":\"0.3.0\",\"capabilities\":[\"serial.heartbeat\",\"led.ring\",\"mic.stereo\",\"speaker.pcm\",\"display.eyes\"]}");
+    Serial.printf("{\"type\":\"display.state\",\"enabled\":%s,\"animation\":\"%s\",\"ready\":%s}\n",
+                  displayEnabled ? "true" : "false", eyeAnimationName(eyeAnimation), displayReady ? "true" : "false");
     return;
   }
   if (type == "ping") {
@@ -228,6 +468,26 @@ static void handleCommand(const String &line) {
     leds.speed = constrain(jsonNumber(line, "speed", leds.speed), 0.1f, 4.0f);
     int marker = line.indexOf("\"led\":");
     leds.selected = marker >= 0 && !line.substring(marker + 6).startsWith("null") ? constrain((int)jsonNumber(line, "led", -1), -1, 6) : -1;
+    return;
+  }
+  if (type == "display.set") {
+    const bool requestedEnabled = jsonBool(line, "enabled", displayEnabled);
+    const EyeAnimation requestedAnimation = parseEyeAnimation(jsonString(line, "animation", eyeAnimationName(eyeAnimation)));
+    const uint32_t requestId = (uint32_t)jsonNumber(line, "requestId", 0);
+    if (requestedAnimation != eyeAnimation) {
+      transitionFromPose = lastEyePose;
+      eyeAnimation = requestedAnimation;
+      eyeAnimationStartedAt = millis();
+      eyeTransitionStartedAt = millis();
+    }
+    if (requestedEnabled != displayEnabled) {
+      transitionFromPose = lastEyePose;
+      displayEnabled = requestedEnabled;
+      displayChangedAt = millis();
+      eyeTransitionStartedAt = millis();
+    }
+    Serial.printf("{\"type\":\"display.ack\",\"enabled\":%s,\"animation\":\"%s\",\"requestId\":%lu}\n",
+                  displayEnabled ? "true" : "false", eyeAnimationName(eyeAnimation), (unsigned long)requestId);
     return;
   }
   if (type == "mic.config") {
@@ -318,12 +578,18 @@ void setup() {
   delay(300);
   Serial.println("{\"type\":\"debug\",\"stage\":\"setup\"}");
   pixels.begin(); pixels.clear(); pixels.show();
-  Serial.println("{\"type\":\"boot\",\"board\":\"waveshare-esp32-s3-audio\",\"firmware\":\"0.2.0\"}");
+  Serial.println("{\"type\":\"boot\",\"board\":\"waveshare-esp32-s3-audio\",\"firmware\":\"0.3.0\"}");
   xTaskCreatePinnedToCore(audioInitTask, "audio-init", 8192, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
+  if (audioInitDone && !displayInitAttempted) {
+    displayInitAttempted = true;
+    displayReady = initializeDisplay();
+    if (!displayReady) sendError("display_init_failed", "ST7789 display initialization failed");
+  }
   renderLeds();
+  renderDisplay();
   if (pcmRemaining) receiveSpeakerPcm();
   else {
     while (Serial.available()) {
